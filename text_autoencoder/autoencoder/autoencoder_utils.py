@@ -79,7 +79,7 @@ class FeatureDataset(Dataset):
 
     def __getitem__(self, i):
         feat_dict = self.features[i]
-        feat = Feature(**feat_dict)
+        feat = Feature(feat_dict['bert_ids'], feat_dict['gpt2_ids'], feat_dict['highlights'])
         return feat
 
     def __len__(self):
@@ -109,11 +109,59 @@ class FeatureDataset(Dataset):
         return (input_ids_bert, input_ids_dec, lm_labels, cond)
 
 
+# class BucketingDataLoader(object):
+#     """ this loads pt chunks and then convert to mini-batch loader"""
+#     def __init__(self, pt_name, batch_size, max_seq_len,
+#                  bucket=100, shuffle=True,
+#                  rank=0, num_replica=1):
+
+#         self.pt_name = pt_name
+#         self.batch_size = batch_size
+#         self.max_len = max_seq_len
+#         self.bucket_size = bucket * batch_size
+#         self.shuffle = shuffle
+#         self.rank = rank
+#         self.num_replica = num_replica
+
+
+#     def __iter__(self):
+#         chunk = self.pt_name[self.rank::self.num_replica] # load from dataset
+
+#         # chunk = torch.load(self.pt_name)[self.rank::self.num_replica]
+#         # discard long examples
+#         trunc_chunk = []
+#         lens = []
+#         total = len(chunk)
+#         for feat in chunk:
+#             import pdb; pdb.set_trace()
+#             if len(feat['gpt2_ids'])+2 > tokenizer_gpt2.max_len_single_sentence or len(feat['bert_ids']) > tokenizer_bert.max_len_single_sentence:
+#                 continue
+#             tot_len = len(feat['gpt2_ids'])
+#             if tot_len > self.max_len:
+#                 feat['gpt2_ids'] = feat['gpt2_ids'][:self.max_len]
+#             if len(feat['bert_ids']) > self.max_len:
+#                 feat['bert_ids'] = feat['bert_ids'][:self.max_len]
+#             trunc_chunk.append(feat)
+#             lens.append(tot_len)
+#         print (f"{self.pt_name}: rank {self.rank} has chunks {len(trunc_chunk)}/{total}, batch_size: {self.batch_size}")
+#         print (f"{self.pt_name}: rank {self.rank} has chunks {len(trunc_chunk)}/{total}, total iterations: {len(trunc_chunk)//self.batch_size}")
+#         dataset = FeatureDataset(trunc_chunk)
+#         sampler = BucketSampler(lens, self.bucket_size, self.batch_size,
+#                                 droplast=True, shuffle=self.shuffle)
+#         loader = DataLoader(dataset, batch_sampler=sampler,
+#                             num_workers=0,  # can test multi-worker
+#                             collate_fn=FeatureDataset.collate)
+#         yield from loader
+
+#     def __len__(self):
+#         return len(self.pt_name) // self.num_replica
+#         # raise NotImplementedError()
+
 class BucketingDataLoader(object):
     """ this loads pt chunks and then convert to mini-batch loader"""
     def __init__(self, pt_name, batch_size, max_seq_len,
                  bucket=100, shuffle=True,
-                 rank=0, num_replica=1):
+                 rank=0, num_replica=1, chunk_size=4096):
 
         self.pt_name = pt_name
         self.batch_size = batch_size
@@ -122,15 +170,38 @@ class BucketingDataLoader(object):
         self.shuffle = shuffle
         self.rank = rank
         self.num_replica = num_replica
-
+        self.chunk_size = chunk_size
+        
 
     def __iter__(self):
-        chunk = torch.load(self.pt_name)[self.rank::self.num_replica]
+        indices = list(range(len(self.pt_name)))
+
+        cur_indices = indices[self.rank::self.num_replica]
+
+        if self.shuffle:
+            random.shuffle(cur_indices)
+
+        for i in range(0, len(cur_indices), self.chunk_size):
+            chunk_indices = cur_indices[i:i+self.chunk_size]
+            yield from self._iter_chunk_(chunk_indices)
+
+    def _iter_chunk_(self, cur_indices):
+
+     
+
+        # divide the indices into num_replica parts
+    
+
+        # chunk = self.pt_name[self.rank::self.num_replica] # load from dataset
+
+        # chunk = torch.load(self.pt_name)[self.rank::self.num_replica]
         # discard long examples
         trunc_chunk = []
         lens = []
-        total = len(chunk)
-        for feat in chunk:
+        total = len(cur_indices)
+        for idx in cur_indices:
+            feat = self.pt_name[idx]
+            # import pdb; pdb.set_trace()
             if len(feat['gpt2_ids'])+2 > tokenizer_gpt2.max_len_single_sentence or len(feat['bert_ids']) > tokenizer_bert.max_len_single_sentence:
                 continue
             tot_len = len(feat['gpt2_ids'])
@@ -151,6 +222,8 @@ class BucketingDataLoader(object):
         yield from loader
 
     def __len__(self):
+        # not accurate
+        # return len(self.pt_name) // self.num_replica
         raise NotImplementedError()
 
 class DistributedBucketingDataLoader(object):
@@ -172,23 +245,23 @@ class DistributedBucketingDataLoader(object):
             loader = BucketingDataLoader(db_name, *self.args, **self.kwargs)
             yield from loader
 
-class InfiniteDistributedBucketingDataLoader(DistributedBucketingDataLoader):
-    def __init__(self, db_dir, *args, **kwargs):
-        super().__init__(db_dir, *args, **kwargs)
-        self.iterator = iter(self)
+# class InfiniteDistributedBucketingDataLoader(DistributedBucketingDataLoader):
+#     def __init__(self, db_dir, *args, **kwargs):
+#         super().__init__(db_dir, *args, **kwargs)
+#         self.iterator = iter(self)
 
-    def __iter__(self):
-        while True:
-            for db_name in self._get_files():
-                loader = BucketingDataLoader(db_name, *self.args, **self.kwargs)
-                yield from loader
+#     def __iter__(self):
+#         while True:
+#             for db_name in self._get_files():
+#                 loader = BucketingDataLoader(db_name, *self.args, **self.kwargs)
+#                 yield from loader
 
-    def __next__(self):
-        while True:
-            try:
-                return next(self.iterator)
-            except StopIteration:
-                self.iterator = iter(self)
+#     def __next__(self):
+#         while True:
+#             try:
+#                 return next(self.iterator)
+#             except StopIteration:
+#                 self.iterator = iter(self)
 
 class TextDataset(Dataset):
     def __init__(self, prefix_path, tokenizer, max_length=16, device=torch.device("cpu")):
@@ -258,7 +331,7 @@ def eval_model_loss(model, gpt_model, gpt_tokenizer, ae_step, eval_dataloader, n
     tot_nll_mid = 0
     input_sentence, input_sentence_corrupted, predict_sentence = [], [], []
     with torch.no_grad():
-        for batch in tqdm.tqdm(eval_dataloader, desc=f"validation_epoch{ae_step}"):
+        for batch in eval_dataloader: # tqdm.tqdm(eval_dataloader, desc=f"validation_epoch{ae_step}"):
             if ground:
                 input_ids_bert, input_ids_dec = batch[3], batch[1]
             else:

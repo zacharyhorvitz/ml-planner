@@ -14,8 +14,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import numpy as np
 from datetime import datetime
+import sys
+sys.path.append('text_autoencoder')
 from utils import set_seed, average_gradients, boolean_string
-from autoencoder_utils import DistributedBucketingDataLoader, eval_model_loss
+from autoencoder_utils import BucketingDataLoader, DistributedBucketingDataLoader, eval_model_loss
 from autoencoder import AutoEncoder, VAE, encoderModels, decoderModels
 from optim import Adamax
 from noiser import *
@@ -23,6 +25,11 @@ from tensorboardX import SummaryWriter
 import tqdm
 import json
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, BertTokenizer
+
+import wandb 
+
+
+from datasets import load_from_disk
 #########################################################################
 # Prepare Parser
 ##########################################################################
@@ -101,6 +108,7 @@ def parse_args():
     parser.add_argument('--MASTER_ADDR', type=str, default='localhost')
     parser.add_argument('--MASTER_PORT', type=str, default='29505')
     parser.add_argument('--start_rank', type=int, default=0)
+    parser.add_argument('--wandb_project', type=str, default='text_autoencoder')
     return parser.parse_args()
 
 def main(args, local_rank):
@@ -119,6 +127,10 @@ def main(args, local_rank):
     if args.world_size == 1 or (dist.get_rank() == 0):
         writer = SummaryWriter(os.path.join(args.save_dir, 'train'))
         writer_eval = SummaryWriter(os.path.join(args.save_dir,'eval')) 
+
+        wandb.init(project=args.wandb_project, name=args.exp_name, config=args)
+
+
         logger.info("arguments")
         logger.info(args)
     #########################################################################
@@ -173,9 +185,16 @@ def main(args, local_rank):
     # Prepare Data Set
     ##########################################################################
     set_seed(args.seed+local_rank)
-    train_dataloader = DistributedBucketingDataLoader(args.train_pt_dir, args.batch_size_per_gpu, args.sentence_len, rank=local_rank, num_replica=args.world_size)
+    dataset = load_from_disk(args.train_pt_dir)
+    train_data = dataset['train']
+    val_data = dataset['validation']
+
+    # train_dataloader = DistributedBucketingDataLoader(args.train_pt_dir, args.batch_size_per_gpu, args.sentence_len, rank=local_rank, num_replica=args.world_size)
+    train_dataloader = BucketingDataLoader(train_data, args.batch_size_per_gpu, args.sentence_len, rank=local_rank, num_replica=args.world_size)
+
     if args.world_size == 1 or (dist.get_rank() == 0):
-        eval_dataloader = DistributedBucketingDataLoader(args.dev_pt_dir, 2*args.batch_size_per_gpu, args.sentence_len, shuffle=False)
+        # eval_dataloader = DistributedBucketingDataLoader(args.dev_pt_dir, 2*args.batch_size_per_gpu, args.sentence_len, shuffle=False)
+        eval_dataloader = BucketingDataLoader(val_data, 2*args.batch_size_per_gpu, args.sentence_len, shuffle=False)
     
     
     #########################################################################
@@ -196,7 +215,7 @@ def main(args, local_rank):
     tokenizer_name = model.decoder.tokenizer.__class__.__name__
     for epoch in range(1, args.epochs+1):
         model.train()
-        for batch in tqdm.tqdm(train_dataloader, desc=f"training_epoch{epoch}"):
+        for batch in train_dataloader: #tqdm.tqdm(train_dataloader, desc=f"training_epoch{epoch}"):
             if args.ground:
                 input_ids_enc, input_ids_dec = batch[3], batch[1]
             else:
@@ -245,7 +264,15 @@ def main(args, local_rank):
                 writer.add_scalar('hidden/h_std', h.std().item() , global_step)
                 writer.add_scalar('hidden/positive_ratio', (h>0).sum()/h.shape.numel(), global_step)
 
-                if global_step % args.val_interval == -1 % args.val_interval:
+                wandb.log({
+                    "loss": loss.item(),
+                    "LR": optimizer.param_groups[0]['lr'],
+                    "h_mean": h.mean().item(),
+                    "h_std": h.std().item(),
+                    "positive_ratio": (h>0).sum()/h.shape.numel(),
+                    })
+
+                if global_step % args.val_interval == 0: #-1 % args.val_interval:
                     model.eval()
                     eval_loss, eval_ppl, eval_mid_ppl, _, rouge_l, bleu = eval_model_loss(model, gpt_model, gpt_tokenizer, global_step, eval_dataloader, noiser, device, logger, max_valid_size=args.valid_size, onlypart=True, ground=args.ground)
 
@@ -261,27 +288,42 @@ def main(args, local_rank):
                     _, _, _, _, _, robust_bleu = eval_model_loss(model, gpt_model, gpt_tokenizer, global_step, eval_dataloader, current_noiser, device, logger, max_valid_size=args.valid_size, onlypart=True, ground=args.ground)
 
 
-
-
                     writer_eval.add_scalar('loss/loss', eval_loss, global_step)
                     writer_eval.add_scalar('metric/int_ppl', eval_mid_ppl, global_step)
                     writer_eval.add_scalar('metric/rouge', rouge_l, global_step)
                     writer_eval.add_scalar('metric/bleu', bleu, global_step)
                     writer_eval.add_scalar('metric/clean_bleu', clean_bleu, global_step)
                     writer_eval.add_scalar('metric/robust_bleu', robust_bleu, global_step)
+
+                    wandb.log({
+                        "eval_loss": eval_loss,
+                        "eval_ppl": eval_ppl,
+                        "eval_mid_ppl": eval_mid_ppl,
+                        "rouge_l": rouge_l,
+                        "bleu": bleu,
+                        "clean_bleu": clean_bleu,
+                        "robust_bleu": robust_bleu,
+                        })
                     
                     
-                    if global_step % args.save_interval == 0 % args.save_interval:
+                    if global_step % args.save_interval == 0: #% args.save_interval:
                         model.save(args.save_dir, 'epoch%d-step%d-ppl%.3f-bleu%.1f'%(epoch, global_step, eval_ppl, bleu))
                     model.train()
 
-                if global_step % args.log_interval == -1 % args.log_interval:
+                if global_step % args.log_interval == 0: #== -1 % args.log_interval:
                     ppl = torch.exp((tr_loss/tr_tokens).clone().detach()).item()
                     logger.info('Training:')
                     logger.info('Epoch: {}, '
                         'Steps: {}, '
                         'Corr: {}, ' 
                         'Loss: {}, PPL: {}'.format(epoch, global_step, tr_correct/tr_tokens, loss.item(), ppl))
+                    
+                    wandb.log({
+                        "train_loss": loss.item(),
+                        "train_ppl": ppl,
+                        "train_corr": tr_correct/tr_tokens,
+                        })
+
                     
                     rand_id = torch.randint(input_ids_enc.shape[0], (1,))
                     input_sentence = model.decode(input_ids_enc[rand_id,:])
